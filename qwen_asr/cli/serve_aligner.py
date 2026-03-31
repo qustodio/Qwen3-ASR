@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import io
 import os
+import re
 import sys
 import threading
 from typing import Any, Dict, Optional
@@ -86,6 +87,7 @@ _HOOK_ALIGNER_KWARGS: Optional[Dict[str, Any]] = None
 _ALIGNER = None
 _ALIGNER_INIT_LOCK = threading.Lock()
 _ALIGNER_INFER_LOCK = threading.Lock()
+_SENTENCE_END_CHARS = (".", "!", "?", "。", "！", "？", ";", "；")
 
 
 def _bytes_to_wav_16k_mono(audio_data: bytes) -> np.ndarray:
@@ -113,6 +115,194 @@ def _get_aligner(aligner_ckpt: str, aligner_kwargs: Dict[str, Any]):
 def _is_qwen3_asr_handler(handler: Any) -> bool:
     model_cls = getattr(handler, "model_cls", None)
     return getattr(model_cls, "__name__", "") == "Qwen3ASRForConditionalGeneration"
+
+
+def _is_sentence_boundary(text: str) -> bool:
+    s = (text or "").strip()
+    if not s:
+        return False
+    return any(ch in s for ch in _SENTENCE_END_CHARS)
+
+
+def _segment_split_mode(request: Any) -> str:
+    """
+    Sentence split mode:
+      - loose  : split if token contains any sentence end punctuation.
+      - strict : split only if token ends with sentence end punctuation.
+
+    Request-level override:
+      request.vllm_xargs["segment_split_mode"] in {"loose","strict"}
+    Global default override:
+      env QWEN_ASR_SEGMENT_SPLIT_MODE in {"loose","strict"}
+    """
+    mode = (os.environ.get("QWEN_ASR_SEGMENT_SPLIT_MODE") or "loose").strip().lower()
+    xargs = getattr(request, "vllm_xargs", None) or {}
+    req_mode = str(xargs.get("segment_split_mode", "")).strip().lower()
+    if req_mode in {"loose", "strict"}:
+        mode = req_mode
+    if mode not in {"loose", "strict"}:
+        mode = "loose"
+    return mode
+
+
+def _join_token_text(buf: list[str]) -> str:
+    # Keep CJK punctuation/characters compact while preserving spaces for non-CJK words.
+    out = ""
+    for tok in buf:
+        t = (tok or "").strip()
+        if not t:
+            continue
+        if not out:
+            out = t
+            continue
+        if t in _SENTENCE_END_CHARS:
+            out += t
+            continue
+        if len(t) == 1 and ("\u4e00" <= t <= "\u9fff"):
+            out += t
+            continue
+        out += " " + t
+    return out.strip()
+
+
+def _build_sentence_segments(
+    words: list[Any],
+    temperature: float,
+    segment_cls: Any,
+    *,
+    strict_boundary: bool = False,
+) -> list[Any]:
+    if not words:
+        return []
+    segments = []
+    buf_text: list[str] = []
+    buf_start = float(words[0].start)
+    buf_end = float(words[0].end)
+    seg_id = 0
+
+    for w in words:
+        wt = str(getattr(w, "word", "") or "")
+        ws = float(getattr(w, "start"))
+        we = float(getattr(w, "end"))
+        if not buf_text:
+            buf_start = ws
+        buf_text.append(wt)
+        buf_end = we
+        if strict_boundary:
+            is_boundary = wt.strip().endswith(_SENTENCE_END_CHARS)
+        else:
+            is_boundary = _is_sentence_boundary(wt)
+        if is_boundary:
+            sent_text = _join_token_text(buf_text)
+            if sent_text:
+                segments.append(
+                    segment_cls(
+                        id=seg_id,
+                        seek=0,
+                        start=buf_start,
+                        end=buf_end,
+                        temperature=temperature,
+                        text=sent_text,
+                        tokens=[],
+                    )
+                )
+                seg_id += 1
+            buf_text = []
+
+    if buf_text:
+        sent_text = _join_token_text(buf_text)
+        if sent_text:
+            segments.append(
+                segment_cls(
+                    id=seg_id,
+                    seek=0,
+                    start=buf_start,
+                    end=buf_end,
+                    temperature=temperature,
+                    text=sent_text,
+                    tokens=[],
+                )
+            )
+    return segments
+
+
+def _sentence_units_from_text(text: str) -> list[str]:
+    """
+    Split transcript text into sentence-like units while preserving punctuation.
+    """
+    s = (text or "").strip()
+    if not s:
+        return []
+    parts = re.findall(r"[^.!?。！？;；]+[.!?。！？;；]*", s)
+    return [p.strip() for p in parts if p and p.strip()]
+
+
+def _token_count_for_alignment(text: str) -> int:
+    """
+    Estimate token count in plain transcript text to map onto aligned `words`.
+    """
+    if not text:
+        return 0
+    toks = re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?|[\u4e00-\u9fff]+", text)
+    return len(toks)
+
+
+def _build_sentence_segments_from_text(
+    transcript_text: str,
+    words: list[Any],
+    temperature: float,
+    segment_cls: Any,
+) -> list[Any]:
+    """
+    Build sentence segments using punctuation from transcript text and
+    timestamps from aligned words.
+    """
+    if not words:
+        return []
+    units = _sentence_units_from_text(transcript_text)
+    if len(units) <= 1:
+        return []
+
+    segments = []
+    w_idx = 0
+    for i, sent in enumerate(units):
+        remaining_sent = len(units) - i
+        remaining_words = len(words) - w_idx
+        if remaining_words <= 0:
+            break
+
+        if i == len(units) - 1:
+            take = remaining_words
+        else:
+            est = max(1, _token_count_for_alignment(sent))
+            min_for_rest = remaining_sent - 1  # keep at least 1 word per remaining sentence
+            take = min(est, max(1, remaining_words - min_for_rest))
+
+        end_idx = min(len(words), w_idx + take)
+        if end_idx <= w_idx:
+            continue
+
+        seg_start = float(words[w_idx].start)
+        seg_end = float(words[end_idx - 1].end)
+        segments.append(
+            segment_cls(
+                id=len(segments),
+                seek=0,
+                start=seg_start,
+                end=seg_end,
+                temperature=temperature,
+                text=sent.strip(),
+                tokens=[],
+            )
+        )
+        w_idx = end_idx
+
+    if not segments:
+        return []
+    # If tiny alignment mismatch leaves trailing words, stretch the last segment end.
+    if w_idx < len(words):
+        segments[-1].end = float(words[-1].end)
+    return segments
 
 
 def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[str, Any]) -> None:
@@ -217,20 +407,39 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
             )
             for item in align_result.items
         ]
-        segment = TranscriptionSegment(
-            id=0,
-            seek=0,
-            start=float(words[0].start),
-            end=float(words[-1].end),
-            temperature=request.temperature,
-            text=plain_text,
-            tokens=[],
+        split_mode = _segment_split_mode(request)
+        # Preferred: split by punctuation from transcript text, map onto word timestamps.
+        segments = _build_sentence_segments_from_text(
+            plain_text,
+            words,
+            request.temperature,
+            TranscriptionSegment,
         )
+        # Fallback: split from word tokens only.
+        if not segments:
+            segments = _build_sentence_segments(
+                words,
+                request.temperature,
+                TranscriptionSegment,
+                strict_boundary=(split_mode == "strict"),
+            )
+        if not segments:
+            segments = [
+                TranscriptionSegment(
+                    id=0,
+                    seek=0,
+                    start=float(words[0].start),
+                    end=float(words[-1].end),
+                    temperature=request.temperature,
+                    text=plain_text,
+                    tokens=[],
+                )
+            ]
         return TranscriptionResponseVerbose(
             text=plain_text,
             language=request.language or lang or "",
             duration=str(duration_s),
-            segments=[segment],
+            segments=segments,
             words=words,
         )
 
