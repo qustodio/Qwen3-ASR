@@ -102,6 +102,71 @@ def _bytes_to_wav_16k_mono(audio_data: bytes) -> np.ndarray:
     return wav
 
 
+def _audio_stats(wav: np.ndarray) -> Dict[str, float]:
+    x = np.asarray(wav, dtype=np.float32)
+    if x.size == 0:
+        return {"rms": 0.0, "peak": 0.0}
+    rms = float(np.sqrt(np.mean(np.square(x))))
+    peak = float(np.max(np.abs(x)))
+    return {"rms": rms, "peak": peak}
+
+
+def _is_low_energy_audio(wav: np.ndarray) -> bool:
+    """
+    Cheap audio gate to suppress obvious silence/background-only inputs.
+    Tunable via env vars:
+      QWEN_ASR_SILENCE_RMS_TH (default: 0.008)
+      QWEN_ASR_SILENCE_PEAK_TH (default: 0.05)
+    """
+    st = _audio_stats(wav)
+    rms_th = float(os.environ.get("QWEN_ASR_SILENCE_RMS_TH", "0.008"))
+    peak_th = float(os.environ.get("QWEN_ASR_SILENCE_PEAK_TH", "0.05"))
+    return st["rms"] < rms_th and st["peak"] < peak_th
+
+
+def _should_suppress_hallucinated_text(text: str, wav: np.ndarray) -> bool:
+    """
+    Suppress very short likely-hallucinated outputs on low-energy audio.
+    Tunable via env var:
+      QWEN_ASR_SHORT_TEXT_LEN_TH (default: 3)
+    """
+    s = (text or "").strip()
+    if not s:
+        return True
+    # Only kick in for low-energy inputs to avoid harming real speech.
+    if not _is_low_energy_audio(wav):
+        return False
+    tlen_th = int(os.environ.get("QWEN_ASR_SHORT_TEXT_LEN_TH", "3"))
+    # Count letters/digits/CJK only.
+    core = re.findall(r"[A-Za-z0-9\u4e00-\u9fff]", s)
+    return len(core) <= tlen_th
+
+
+def _looks_suspicious_short_text(text: str, requested_lang: Optional[str]) -> bool:
+    """
+    Text-only guard (independent of audio energy):
+    - suppress ultra-short garbage-like outputs
+    - suppress short script-mismatch outputs for forced language requests
+    Tunable via env:
+      QWEN_ASR_SHORT_TEXT_SCRIPT_MISMATCH_TH (default: 6)
+    """
+    s = (text or "").strip()
+    if not s:
+        return True
+    latin = len(re.findall(r"[A-Za-z]", s))
+    cjk = len(re.findall(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", s))
+    core = latin + cjk + len(re.findall(r"[0-9]", s))
+    if core <= 1:
+        return True
+
+    mismatch_th = int(os.environ.get("QWEN_ASR_SHORT_TEXT_SCRIPT_MISMATCH_TH", "6"))
+    if requested_lang == "English" and cjk > 0 and latin == 0 and core <= mismatch_th:
+        return True
+    if requested_lang in {"Chinese", "Cantonese", "Japanese", "Korean"} and latin > 0 and cjk == 0 and core <= mismatch_th:
+        return True
+    return False
+
+
 def _get_aligner(aligner_ckpt: str, aligner_kwargs: Dict[str, Any]):
     global _ALIGNER
     with _ALIGNER_INIT_LOCK:
@@ -237,6 +302,37 @@ def _sentence_units_from_text(text: str) -> list[str]:
     return [p.strip() for p in parts if p and p.strip()]
 
 
+def _sanitize_asr_text(text: str) -> str:
+    """
+    Remove leaked control markers like:
+      - language Chinese<asr_text>
+      - language Japanese <asr_text>
+    which occasionally appear in model output.
+    """
+    s = (text or "").strip()
+    if not s:
+        return ""
+    # If a leaked control tail starts with "language ...", drop everything from there.
+    # Examples:
+    #   "... normal text. language Chinese<asr_text>嗯。"
+    #   "... normal text\nlanguage Japanese<asr_text>な。"
+    tail_match = re.search(
+        r"(?i)(?:^|[\n\r]|[.!?。！？;；]\s*)language\s+[A-Za-z][A-Za-z_-]*(?:\s*<asr_text>)?",
+        s,
+    )
+    if tail_match and tail_match.start() > 0:
+        s = s[: tail_match.start()].strip()
+    # Remove inline language-prefix markers (case-insensitive).
+    s = re.sub(r"language\s+[A-Za-z]+\s*<asr_text>", "", s, flags=re.IGNORECASE)
+    # Remove any dangling asr tag if leaked alone.
+    s = s.replace("<asr_text>", "")
+    # Cleanup extra spaces left by removals.
+    s = re.sub(r"\s{2,}", " ", s).strip()
+    # Remove spaces before punctuation where possible.
+    s = re.sub(r"\s+([.!?。！？;；,，])", r"\1", s)
+    return s
+
+
 def _token_count_for_alignment(text: str) -> int:
     """
     Estimate token count in plain transcript text to map onto aligned `words`.
@@ -351,11 +447,22 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
         if request.language:
             user_lang_name = self.model_cls.supported_languages.get(request.language)
 
-        lang, plain_text = parse_asr_output(base.text, user_language=user_lang_name)
-        align_lang = lang or user_lang_name or "English"
+        # Parse raw model output without forcing user language, so metadata can be stripped robustly.
+        lang, plain_text = parse_asr_output(base.text, user_language=None)
+        plain_text = _sanitize_asr_text(plain_text)
+        align_lang = user_lang_name or lang or "English"
 
         wav = _bytes_to_wav_16k_mono(audio_data)
         duration_s = float(len(wav)) / 16000.0
+        if _is_low_energy_audio(wav):
+            LOGGER.info("Low-energy audio detected; suppressing transcript")
+            return TranscriptionResponseVerbose(
+                text="",
+                language=request.language or lang or "",
+                duration=str(duration_s),
+                segments=[],
+                words=[],
+            )
         if not plain_text.strip():
             return TranscriptionResponseVerbose(
                 text="",
@@ -363,6 +470,28 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
                 duration=str(duration_s),
                 segments=[],
                 words=None,
+            )
+        if _looks_suspicious_short_text(plain_text, user_lang_name):
+            LOGGER.info(
+                "Suppressing suspicious short/script-mismatch transcript: %r (requested_lang=%r)",
+                plain_text,
+                user_lang_name,
+            )
+            return TranscriptionResponseVerbose(
+                text="",
+                language=request.language or lang or "",
+                duration=str(duration_s),
+                segments=[],
+                words=[],
+            )
+        if _should_suppress_hallucinated_text(plain_text, wav):
+            LOGGER.info("Suppressing likely hallucinated short transcript on low-energy audio: %r", plain_text)
+            return TranscriptionResponseVerbose(
+                text="",
+                language=request.language or lang or "",
+                duration=str(duration_s),
+                segments=[],
+                words=[],
             )
 
         aligner = _get_aligner(_HOOK_ALIGNER_CKPT, _HOOK_ALIGNER_KWARGS or {})
