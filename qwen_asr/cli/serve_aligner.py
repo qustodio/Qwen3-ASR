@@ -18,8 +18,10 @@ vLLM ``serve`` entry with forced-aligner support for ``/v1/audio/transcriptions`
 (``response_format=verbose_json``). Use console script ``qwen-asr-serve-aligner``.
 
 The forced aligner defaults to **CPU** so it does not compete with vLLM for VRAM.
-To load it on a GPU instead (e.g. if you lowered vLLM memory or use a second GPU),
-set environment variable ``QWEN_ASR_ALIGNER_DEVICE`` (e.g. ``cuda:0`` or ``cuda:1``).
+To run it on GPU (when you have spare VRAM or a second GPU), either:
+
+- Pass ``--aligner-device cuda:0`` (or ``cuda:1``, etc.) before other ``vllm serve`` args, or
+- Set environment variable ``QWEN_ASR_ALIGNER_DEVICE`` (same values; ``cpu`` forces CPU).
 """
 from __future__ import annotations
 
@@ -28,8 +30,9 @@ import io
 import os
 import re
 import sys
+import unicodedata
 import threading
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import librosa
 import numpy as np
@@ -65,11 +68,36 @@ LOGGER = init_logger(__name__)
 DEFAULT_FORCED_ALIGNER_CHECKPOINT = "Qwen/Qwen3-ForcedAligner-0.6B"
 
 
+def _pop_aligner_device_cli(argv: List[str]) -> List[str]:
+    """
+    Remove ``--aligner-device <value>`` from argv and set ``QWEN_ASR_ALIGNER_DEVICE``.
+    vLLM does not understand this flag.
+    """
+    out: List[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--aligner-device":
+            if i + 1 >= len(argv):
+                print(
+                    "qwen-asr-serve-aligner: --aligner-device requires a value "
+                    "(e.g. cuda:0, cuda:1, cpu)",
+                    file=sys.stderr,
+                )
+                raise SystemExit(2)
+            os.environ["QWEN_ASR_ALIGNER_DEVICE"] = argv[i + 1]
+            i += 2
+            continue
+        out.append(argv[i])
+        i += 1
+    return out
+
+
 def _forced_aligner_from_pretrained_kwargs() -> Dict[str, Any]:
     """
     Kwargs for ``Qwen3ForcedAligner.from_pretrained``.
 
     Default CPU avoids CUDA OOM alongside a GPU-resident vLLM ASR engine.
+    Override with ``QWEN_ASR_ALIGNER_DEVICE`` or ``--aligner-device`` (see module docstring).
     """
     import torch
 
@@ -124,6 +152,37 @@ def _is_low_energy_audio(wav: np.ndarray) -> bool:
     return st["rms"] < rms_th and st["peak"] < peak_th
 
 
+def _letter_or_digit_char_count(s: str) -> int:
+    """Unicode letters + digits (Cyrillic, Arabic, CJK, Latin, etc.)."""
+    return sum(1 for ch in s if ch.isdigit() or unicodedata.category(ch).startswith("L"))
+
+
+def _all_aligned_word_times_near_zero(words: list[Any], duration_s: float) -> bool:
+    """
+    Detect degenerate forced alignment: word items exist but every start/end is ~0.
+    Common when the ASR hallucinates over music/noise and the aligner cannot place text.
+
+    Opt out with env ``QWEN_ASR_KEEP_ZERO_ALIGNED_TRANSCRIPTS=1``.
+    Epsilon override: ``QWEN_ASR_ALIGN_ZERO_EPS`` (default 1e-3).
+    """
+    if not words:
+        return False
+    if (os.environ.get("QWEN_ASR_KEEP_ZERO_ALIGNED_TRANSCRIPTS") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return False
+    eps = float(os.environ.get("QWEN_ASR_ALIGN_ZERO_EPS", "1e-3"))
+    # Ignore pathological zero-duration requests.
+    if duration_s <= 0.0:
+        return False
+    for w in words:
+        if abs(float(w.start)) > eps or abs(float(w.end)) > eps:
+            return False
+    return True
+
+
 def _should_suppress_hallucinated_text(text: str, wav: np.ndarray) -> bool:
     """
     Suppress very short likely-hallucinated outputs on low-energy audio.
@@ -137,9 +196,7 @@ def _should_suppress_hallucinated_text(text: str, wav: np.ndarray) -> bool:
     if not _is_low_energy_audio(wav):
         return False
     tlen_th = int(os.environ.get("QWEN_ASR_SHORT_TEXT_LEN_TH", "3"))
-    # Count letters/digits/CJK only.
-    core = re.findall(r"[A-Za-z0-9\u4e00-\u9fff]", s)
-    return len(core) <= tlen_th
+    return _letter_or_digit_char_count(s) <= tlen_th
 
 
 def _looks_suspicious_short_text(text: str, requested_lang: Optional[str]) -> bool:
@@ -155,12 +212,13 @@ def _looks_suspicious_short_text(text: str, requested_lang: Optional[str]) -> bo
         return True
     latin = len(re.findall(r"[A-Za-z]", s))
     cjk = len(re.findall(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", s))
-    core = latin + cjk + len(re.findall(r"[0-9]", s))
+    cyrillic = len(re.findall(r"[\u0400-\u04FF\u0500-\u052F]", s))
+    core = _letter_or_digit_char_count(s)
     if core <= 1:
         return True
 
     mismatch_th = int(os.environ.get("QWEN_ASR_SHORT_TEXT_SCRIPT_MISMATCH_TH", "6"))
-    if requested_lang == "English" and cjk > 0 and latin == 0 and core <= mismatch_th:
+    if requested_lang == "English" and latin == 0 and (cjk > 0 or cyrillic > 0) and core <= mismatch_th:
         return True
     if requested_lang in {"Chinese", "Cantonese", "Japanese", "Korean"} and latin > 0 and cjk == 0 and core <= mismatch_th:
         return True
@@ -291,15 +349,55 @@ def _build_sentence_segments(
     return segments
 
 
+# Periods inside these spans are not sentence boundaries (e.g. "Mr. Smith").
+_ABBREV_DOT_PROTECT = re.compile(
+    r"(?:"
+    r"\bPh\.D\."
+    r"|\be\.g\."
+    r"|\bi\.e\."
+    r"|\bU\.S\."
+    r"|\bU\.K\."
+    r"|\b(?:Mrs|Ms|Mr|Dr|Prof|Sr|Jr|St|vs|etc|al|ed|vol|no|fig|approx)\."
+    r"|\b(?:Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\."
+    r")",
+    re.IGNORECASE,
+)
+_DOT_SENTINEL_START = "\ue000"
+_DOT_SENTINEL_END = "\ue001"
+
+
 def _sentence_units_from_text(text: str) -> list[str]:
     """
     Split transcript text into sentence-like units while preserving punctuation.
+
+    Does not split on periods that belong to common abbreviations (e.g. ``Mr.``)
+    or decimal numbers (e.g. ``3.14``).
     """
     s = (text or "").strip()
     if not s:
         return []
+    vault: list[str] = []
+
+    def stash(match: re.Match[str]) -> str:
+        vault.append(match.group(0))
+        return f"{_DOT_SENTINEL_START}{len(vault) - 1}{_DOT_SENTINEL_END}"
+
+    s = re.sub(r"\d+\.\d+", stash, s)
+    s = _ABBREV_DOT_PROTECT.sub(stash, s)
     parts = re.findall(r"[^.!?。！？;；]+[.!?。！？;；]*", s)
-    return [p.strip() for p in parts if p and p.strip()]
+
+    def unstash(m: re.Match[str]) -> str:
+        return vault[int(m.group(1))]
+
+    out: list[str] = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        p = re.sub(rf"{re.escape(_DOT_SENTINEL_START)}(\d+){re.escape(_DOT_SENTINEL_END)}", unstash, p)
+        if p.strip():
+            out.append(p.strip())
+    return out
 
 
 def _sanitize_asr_text(text: str) -> str:
@@ -339,8 +437,8 @@ def _token_count_for_alignment(text: str) -> int:
     """
     if not text:
         return 0
-    toks = re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?|[\u4e00-\u9fff]+", text)
-    return len(toks)
+    # Unicode word runs (Cyrillic, Latin, CJK, etc.); matches default str semantics in Python 3.
+    return len(re.findall(r"\w+", text))
 
 
 def _build_sentence_segments_from_text(
@@ -536,6 +634,19 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
             )
             for item in align_result.items
         ]
+        if _all_aligned_word_times_near_zero(words, duration_s):
+            LOGGER.info(
+                "Suppressing transcript: %d aligned words but all timestamps ~0 (duration=%.3fs)",
+                len(words),
+                duration_s,
+            )
+            return TranscriptionResponseVerbose(
+                text="",
+                language=request.language or lang or "",
+                duration=str(duration_s),
+                segments=[],
+                words=[],
+            )
         split_mode = _segment_split_mode(request)
         # Preferred: split by punctuation from transcript text, map onto word timestamps.
         segments = _build_sentence_segments_from_text(
@@ -576,8 +687,13 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
 
 
 def main():
+    sys.argv[1:] = _pop_aligner_device_cli(sys.argv[1:])
     kw = _forced_aligner_from_pretrained_kwargs()
-    LOGGER.info("Loading Qwen3-ForcedAligner with %s (set QWEN_ASR_ALIGNER_DEVICE to override)", kw)
+    LOGGER.info(
+        "Loading Qwen3-ForcedAligner with %s "
+        "(override: --aligner-device cuda:0 or QWEN_ASR_ALIGNER_DEVICE)",
+        kw,
+    )
     _install_transcription_aligner_hook(DEFAULT_FORCED_ALIGNER_CHECKPOINT, kw)
     sys.argv.insert(1, "serve")
     vllm_main()
