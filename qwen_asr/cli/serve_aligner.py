@@ -22,6 +22,11 @@ To run it on GPU (when you have spare VRAM or a second GPU), either:
 
 - Pass ``--aligner-device cuda:0`` (or ``cuda:1``, etc.) before other ``vllm serve`` args, or
 - Set environment variable ``QWEN_ASR_ALIGNER_DEVICE`` (same values; ``cpu`` forces CPU).
+
+Concurrent requests: forced alignment no longer serializes globally by default. To cap how
+many aligner forwards run at once (e.g. to limit RAM on CPU or VRAM on GPU), set
+``QWEN_ASR_ALIGNER_MAX_CONCURRENT`` to an integer (``1`` restores strict serialization).
+Unset or ``0`` means no limit.
 """
 from __future__ import annotations
 
@@ -114,8 +119,45 @@ _HOOK_ALIGNER_CKPT: Optional[str] = None
 _HOOK_ALIGNER_KWARGS: Optional[Dict[str, Any]] = None
 _ALIGNER = None
 _ALIGNER_INIT_LOCK = threading.Lock()
-_ALIGNER_INFER_LOCK = threading.Lock()
+# None = unlimited concurrent align() calls; Lock(1) or Semaphore(N) when configured.
+_ALIGNER_INFER_LIMITER: Optional[Any] = None
 _SENTENCE_END_CHARS = (".", "!", "?", "。", "！", "？", ";", "；")
+
+
+def _configure_aligner_infer_limiter() -> None:
+    """
+    Read ``QWEN_ASR_ALIGNER_MAX_CONCURRENT`` once at hook install time.
+
+    - unset / empty / ``0``: no limiter (parallel aligner inference).
+    - ``1``: global lock (legacy serialized behavior).
+    - ``N>1``: at most N aligner forwards at a time.
+    """
+    global _ALIGNER_INFER_LIMITER
+    raw = (os.environ.get("QWEN_ASR_ALIGNER_MAX_CONCURRENT") or "0").strip().lower()
+    if raw in ("", "0", "unlimited", "none"):
+        _ALIGNER_INFER_LIMITER = None
+        LOGGER.info("Forced-aligner inference concurrency: unlimited")
+        return
+    try:
+        n = int(raw)
+    except ValueError:
+        LOGGER.warning(
+            "Ignoring invalid QWEN_ASR_ALIGNER_MAX_CONCURRENT=%r; using unlimited aligner concurrency",
+            os.environ.get("QWEN_ASR_ALIGNER_MAX_CONCURRENT"),
+        )
+        _ALIGNER_INFER_LIMITER = None
+        LOGGER.info("Forced-aligner inference concurrency: unlimited")
+        return
+    if n <= 0:
+        _ALIGNER_INFER_LIMITER = None
+        LOGGER.info("Forced-aligner inference concurrency: unlimited")
+        return
+    if n == 1:
+        _ALIGNER_INFER_LIMITER = threading.Lock()
+        LOGGER.info("Forced-aligner inference concurrency: serialized (1)")
+        return
+    _ALIGNER_INFER_LIMITER = threading.Semaphore(n)
+    LOGGER.info("Forced-aligner inference concurrency: max %d concurrent", n)
 
 
 def _bytes_to_wav_16k_mono(audio_data: bytes) -> np.ndarray:
@@ -502,6 +544,8 @@ def _build_sentence_segments_from_text(
 def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[str, Any]) -> None:
     global _ORIG_CREATE_SPEECH_TO_TEXT, _HOOK_ALIGNER_CKPT, _HOOK_ALIGNER_KWARGS
 
+    _configure_aligner_infer_limiter()
+
     _HOOK_ALIGNER_CKPT = aligner_ckpt
     _HOOK_ALIGNER_KWARGS = dict(aligner_kwargs)
 
@@ -597,7 +641,11 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
         def _do_align():
             from qwen_asr.inference.utils import SAMPLE_RATE
 
-            with _ALIGNER_INFER_LOCK:
+            lim = _ALIGNER_INFER_LIMITER
+            if lim is not None:
+                with lim:
+                    out = aligner.align(audio=(wav, SAMPLE_RATE), text=plain_text, language=align_lang)
+            else:
                 out = aligner.align(audio=(wav, SAMPLE_RATE), text=plain_text, language=align_lang)
             return out[0] if out else None
 

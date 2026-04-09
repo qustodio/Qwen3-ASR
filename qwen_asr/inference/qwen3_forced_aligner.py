@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import threading
 import unicodedata
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
@@ -36,6 +37,7 @@ from .utils import (
 
 class Qwen3ForceAlignProcessor():
     def __init__(self):
+        self._ko_tokenizer_lock = threading.Lock()
         ko_dict_path = os.path.join(os.path.dirname(__file__), "assets", "korean_dict_jieba.dict")
         ko_scores = {}
         with open(ko_dict_path, "r", encoding="utf-8") as f:
@@ -239,10 +241,13 @@ class Qwen3ForceAlignProcessor():
         if language.lower() == "japanese":
             word_list = self.tokenize_japanese(text)
         elif language.lower() == "korean":
-            if self.ko_tokenizer is None:
-                from soynlp.tokenizer import LTokenizer
-                self.ko_tokenizer = LTokenizer(scores=self.ko_score)
-            word_list = self.tokenize_korean(self.ko_tokenizer, text)
+            with self._ko_tokenizer_lock:
+                if self.ko_tokenizer is None:
+                    from soynlp.tokenizer import LTokenizer
+
+                    self.ko_tokenizer = LTokenizer(scores=self.ko_score)
+                ko_tok = self.ko_tokenizer
+            word_list = self.tokenize_korean(ko_tok, text)
         else:
             word_list = self.tokenize_space_lang(text)
         
