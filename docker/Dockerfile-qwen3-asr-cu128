@@ -1,25 +1,39 @@
 # Dockerfile of qwenllm/qwen3-asr:cu128
+#
+# Multi-stage build:
+#   - `builder` stage uses the CUDA *devel* image to compile flash-attn / vLLM
+#     kernels, installing everything into a self-contained venv at /opt/venv.
+#   - final stage uses the CUDA *runtime* image and just copies /opt/venv,
+#     dropping ~2-3 GB of build toolchain (cmake, nvcc, headers, etc.).
+#
+# Model weights are NOT baked into the image. At runtime every loader
+# (Hugging Face Hub, ModelScope, vLLM's download helper) is pointed at
+# /tmp/_cached_models, which is intended to be backed by a PVC so the
+# downloaded weights persist across pod restarts.
+
+# syntax=docker/dockerfile:1.7
 
 ARG CUDA_VERSION=12.8.0
-ARG from=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
-FROM ${from} as base
+
+############################
+# Stage 1: builder (devel) #
+############################
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04 AS builder
 
 ARG DEBIAN_FRONTEND=noninteractive
 RUN <<EOF
-apt update -y && apt upgrade -y && apt install -y --no-install-recommends  \
+apt-get update -y && apt-get install -y --no-install-recommends \
     git \
     git-lfs \
     python3 \
     python3-pip \
     python3-dev \
+    python3-venv \
     wget \
-    vim \
-    libsndfile1 \
     ccache \
-    software-properties-common \
-    ffmpeg \
     ca-certificates \
-&& rm -rf /var/lib/apt/lists/*
+    build-essential
+rm -rf /var/lib/apt/lists/*
 EOF
 
 RUN wget https://github.com/Kitware/CMake/releases/download/v3.26.1/cmake-3.26.1-Linux-x86_64.sh \
@@ -30,32 +44,89 @@ RUN wget https://github.com/Kitware/CMake/releases/download/v3.26.1/cmake-3.26.1
     && rm /tmp/cmake-install.sh \
     && ln -s /opt/cmake-3.26.1/bin/* /usr/local/bin
 
-RUN ln -s /usr/bin/python3 /usr/bin/python
-
 RUN git lfs install
-
-WORKDIR /data/shared/Qwen3-ASR
 
 ENV MAX_JOBS=32
 ENV NVCC_THREADS=2
 ENV CCACHE_DIR=/root/.cache/ccache
 
+# Everything goes in a dedicated venv we can copy wholesale to the runtime stage.
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+ENV VIRTUAL_ENV=/opt/venv
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -U pip setuptools wheel
+
+# python3-blinker would otherwise shadow the pip-installed blinker in some
+# environments; we don't install it here, just keeping the behavior aligned
+# with the previous Dockerfile.
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -U "qwen-asr[vllm]"
+
 ARG BUNDLE_FLASH_ATTENTION=true
-
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 install -U pip setuptools wheel
-
-RUN apt remove python3-blinker -y
-
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip3 install -U "qwen-asr[vllm]"
-
 RUN --mount=type=cache,target=/root/.cache/ccache \
     --mount=type=cache,target=/root/.cache/pip \
     if [ "$BUNDLE_FLASH_ATTENTION" = "true" ]; then \
-        pip3 install -U flash-attn --no-build-isolation git+https://github.com/Dao-AILab/flash-attention.git; \
+        pip install -U flash-attn --no-build-isolation git+https://github.com/Dao-AILab/flash-attention.git; \
     fi
 
-RUN rm -rf /root/.cache/pip
+# Trim the venv: strip bytecode caches, tests, and *.pyc files. This
+# commonly drops hundreds of MB from the final image.
+RUN find /opt/venv -depth -type d -name '__pycache__' -exec rm -rf {} + \
+ && find /opt/venv -type f -name '*.pyc' -delete \
+ && find /opt/venv -depth -type d -name 'tests' -exec rm -rf {} + \
+ && find /opt/venv -depth -type d -name 'test' -exec rm -rf {} + \
+ && rm -rf /root/.cache
 
-EXPOSE 80
+############################
+# Stage 2: runtime (slim)  #
+############################
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu22.04 AS runtime
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN <<EOF
+apt-get update -y && apt-get install -y --no-install-recommends \
+    python3 \
+    libsndfile1 \
+    ffmpeg \
+    ca-certificates
+rm -rf /var/lib/apt/lists/*
+ln -sf /usr/bin/python3 /usr/bin/python
+EOF
+
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+ENV VIRTUAL_ENV=/opt/venv
+
+# Centralize every model-cache location so a single PVC mount on
+# /tmp/_cached_models persists all downloaded weights (Qwen3-ASR,
+# Qwen3-ForcedAligner, tokenizers, vLLM compile cache, etc.).
+ENV MODEL_CACHE_DIR=/tmp/_cached_models \
+    HF_HOME=/tmp/_cached_models \
+    HF_HUB_CACHE=/tmp/_cached_models \
+    HUGGINGFACE_HUB_CACHE=/tmp/_cached_models \
+    TRANSFORMERS_CACHE=/tmp/_cached_models \
+    MODELSCOPE_CACHE=/tmp/_cached_models \
+    XDG_CACHE_HOME=/tmp/_cached_models \
+    VLLM_CACHE_ROOT=/tmp/_cached_models/vllm \
+    TORCH_HOME=/tmp/_cached_models/torch
+
+RUN mkdir -p /tmp/_cached_models
+VOLUME ["/tmp/_cached_models"]
+
+WORKDIR /data/shared/Qwen3-ASR
+
+EXPOSE 8000
+
+# Default command: start the vLLM + forced-aligner server. Override with
+# `docker run ... <your-command>` (e.g. `sleep infinity`) to get a shell
+# for debugging without invoking the server.
+CMD ["/opt/venv/bin/qwen-asr-serve-aligner", \
+     "Qwen/Qwen3-ASR-1.7B", \
+     "--gpu-memory-utilization", "0.5", \
+     "--max-model-len", "1024", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--aligner-device", "cuda:0"]
