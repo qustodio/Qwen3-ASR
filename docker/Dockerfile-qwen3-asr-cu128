@@ -62,8 +62,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # environments; we don't install it here, just keeping the behavior aligned
 # with the previous Dockerfile.
 
+# PyPI ``qwen-asr`` wheels (e.g. 0.0.6) ship without ``serve_aligner`` and without
+# the ``qwen-asr-serve-aligner`` console script. Install from this build context
+# so the image CMD matches the repo's ``pyproject.toml`` entry points.
+WORKDIR /src/qwen-asr
+COPY pyproject.toml README.md MANIFEST.in LICENSE ./
+COPY qwen_asr ./qwen_asr/
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -U "qwen-asr[vllm]"
+    pip install ".[vllm]"
+WORKDIR /
 
 ARG BUNDLE_FLASH_ATTENTION=true
 RUN --mount=type=cache,target=/root/.cache/ccache \
