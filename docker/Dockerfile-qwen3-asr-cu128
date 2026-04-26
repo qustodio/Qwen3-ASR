@@ -1,58 +1,40 @@
-# Dockerfile of qwenllm/qwen3-asr:cu128
-#
-# Multi-stage build:
-#   - `builder` stage uses the CUDA *devel* image to compile flash-attn / vLLM
-#     kernels, installing everything into a self-contained venv at /opt/venv.
-#   - final stage uses the CUDA *runtime* image and just copies /opt/venv,
-#     dropping ~2-3 GB of build toolchain (cmake, nvcc, headers, etc.).
-#     Triton (PyTorch Inductor) still needs a **host** C/C++ compiler at vLLM
-#     startup; that is installed in a **separate** runtime layer (see
-#     ``RUNTIME_TRITON_COMPILER``) so you can rebuild or toggle it without
-#     touching the base OS package layer, then merge/squash later if you prefer.
-#
-# Model weights are NOT baked into the image. At runtime every loader
-# (Hugging Face Hub, ModelScope, vLLM's download helper) is pointed at
-# /tmp/_cached_models, which is intended to be backed by a PVC so the
-# downloaded weights persist across pod restarts.
-#
-# Example: full image (default final stage ``runtime``), same as before this
-# file gained ``venv-base`` / overlay split — adjust ``ECR_URI`` / ``ECR_REPO``.
-#
-#   docker buildx build \
-#     --platform linux/amd64 \
-#     --file docker/Dockerfile-qwen3-asr-cu128 \
-#     --tag "${ECR_URI}/${ECR_REPO}:latest" \
-#     --push \
-#     --provenance=false \
-#     --cache-to   "type=registry,ref=${ECR_URI}/${ECR_REPO}:buildcache,mode=max" \
-#     --cache-from "type=registry,ref=${ECR_URI}/${ECR_REPO}:buildcache" \
-#     --build-arg BUNDLE_FLASH_ATTENTION=false \
-#     .
-#
-# Fast iteration (avoid re-pushing the multi-GB venv layer on every edit):
-#   1. Rarely — build/push only ``venv-base`` (heavy ``COPY /opt/venv``), e.g.
-#      when ``pyproject.toml``, ``qwen_asr/``, or the builder stage changes:
-#
-#        docker buildx build \
-#          --platform linux/amd64 \
-#          --file docker/Dockerfile-qwen3-asr-cu128 \
-#          --target venv-base \
-#          --tag "${ECR_URI}/${ECR_REPO}:venv-base-cu128" \
-#          --push \
-#          --provenance=false \
-#          --cache-to   "type=registry,ref=${ECR_URI}/${ECR_REPO}:buildcache,mode=max" \
-#          --cache-from "type=registry,ref=${ECR_URI}/${ECR_REPO}:buildcache" \
-#          --build-arg BUNDLE_FLASH_ATTENTION=false \
-#          .
-#
-#   2. Often — see ``Dockerfile-qwen3-asr-cu128-overlay``: use context
-#      ``docker/overlay-build-context`` and ensure ``:venv-base-cu128`` is
-#      **already in ECR** (and your local ``FROM`` matches that image) or every
-#      ``--push`` of ``:latest`` re-uploads the full layer stack (~5GB).
-
 # syntax=docker/dockerfile:1.7
+#
+# qwen3-asr on CUDA 12.8 (Ubuntu 22.04): builder (devel) -> venv -> runtime.
+# Default final image: ``runtime``. Optional ``--target venv-base`` tags only the
+# heavy ``COPY /opt/venv`` layer for registry cache workflows.
+#
+# Full build / push (repo root; no ``--cache-to``/``--cache-from`` — the default
+# ``docker`` buildx driver does not support registry cache export; use a
+# ``docker-container`` builder if you need that).
+#   docker buildx build --platform linux/amd64 \
+#     -f docker/Dockerfile-qwen3-asr-cu128 \
+#     -t "${ECR_URI}/${ECR_REPO}:latest" --push --provenance=false \
+#     --build-arg BUNDLE_FLASH_ATTENTION=false .
+#
+# Push only the venv layer (when ``pyproject.toml`` / ``qwen_asr`` / builder change):
+#   docker buildx build --platform linux/amd64 \
+#     -f docker/Dockerfile-qwen3-asr-cu128 --target venv-base \
+#     -t "${ECR_URI}/${ECR_REPO}:venv-base-cu128" --push --provenance=false \
+#     --build-arg BUNDLE_FLASH_ATTENTION=false .
+#
+# Thin rebuild on top of a pushed ``venv-base`` (BuildKit skips unreferenced
+# stages such as ``builder`` — use the same ``CUDA_VERSION`` / base family as venv-base):
+#   docker buildx build --platform linux/amd64 \
+#     -f docker/Dockerfile-qwen3-asr-cu128 \
+#     --build-arg VENV_BASE_IMAGE="${ECR_URI}/${ECR_REPO}:venv-base-cu128" \
+#     -t "${ECR_URI}/${ECR_REPO}:latest" --push --provenance=false \
+#     docker/overlay-build-context
+#
+# (``docker/overlay-build-context`` is an empty context dir to avoid tarring the
+# whole repo; use ``.`` if you prefer.)
+#
+# Model caches: mount a PVC on ``/tmp/_cached_models`` (see ENV below).
 
 ARG CUDA_VERSION=12.8.0
+# Must appear **before the first FROM** so ``FROM ${VENV_BASE_IMAGE}`` in stage 3
+# expands (defaults to stage name ``venv-base``; override for thin rebuilds).
+ARG VENV_BASE_IMAGE=venv-base
 
 ############################
 # Stage 1: builder (devel) #
@@ -89,7 +71,6 @@ ENV MAX_JOBS=32
 ENV NVCC_THREADS=2
 ENV CCACHE_DIR=/root/.cache/ccache
 
-# Everything goes in a dedicated venv we can copy wholesale to the runtime stage.
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
 ENV VIRTUAL_ENV=/opt/venv
@@ -97,13 +78,6 @@ ENV VIRTUAL_ENV=/opt/venv
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -U pip setuptools wheel
 
-# python3-blinker would otherwise shadow the pip-installed blinker in some
-# environments; we don't install it here, just keeping the behavior aligned
-# with the previous Dockerfile.
-
-# PyPI ``qwen-asr`` wheels (e.g. 0.0.6) ship without ``serve_aligner`` and without
-# the ``qwen-asr-serve-aligner`` console script. Install from this build context
-# so the image CMD matches the repo's ``pyproject.toml`` entry points.
 WORKDIR /src/qwen-asr
 COPY pyproject.toml README.md MANIFEST.in LICENSE ./
 COPY qwen_asr ./qwen_asr/
@@ -118,9 +92,7 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
         pip install -U flash-attn --no-build-isolation git+https://github.com/Dao-AILab/flash-attention.git; \
     fi
 
-# Trim the venv: strip bytecode caches, optional test trees, and *.pyc files.
-# Only skip ``*/numpy/*``: NumPy 2.x imports ``numpy._core.tests`` at runtime
-# (via ``numpy.testing``). SciPy's ``tests/`` trees are large and safe to prune.
+# Do not prune ``*/numpy/*/tests``: NumPy 2.x imports ``numpy._core.tests`` at runtime.
 RUN find /opt/venv -depth -type d -name '__pycache__' -exec rm -rf {} + \
  && find /opt/venv -type f -name '*.pyc' -delete \
  && find /opt/venv -depth -type d -name 'tests' ! -path '*/numpy/*' -exec rm -rf {} + \
@@ -128,7 +100,7 @@ RUN find /opt/venv -depth -type d -name '__pycache__' -exec rm -rf {} + \
  && rm -rf /root/.cache
 
 ############################
-# Stage 2a: venv base (heavy COPY lives here — tag for overlay builds) #
+# Stage 2: venv (``--target venv-base``) #
 ############################
 FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu22.04 AS venv-base
 
@@ -146,42 +118,31 @@ ENV PATH="/opt/venv/bin:${PATH}"
 ENV VIRTUAL_ENV=/opt/venv
 
 ############################
-# Stage 2b: full runtime (default image) #
+# Stage 3: runtime (default) #
 ############################
-FROM venv-base AS runtime
+FROM ${VENV_BASE_IMAGE} AS runtime
 
 ARG DEBIAN_FRONTEND=noninteractive
-RUN <<EOF
-apt-get update -y && apt-get install -y --no-install-recommends \
-    libsndfile1 \
-    ffmpeg \
-    wget
-rm -rf /var/lib/apt/lists/*
-EOF
-
-# Own layer: Triton JIT-builds a small native helper (needs ``gcc`` + ``Python.h``);
-# omit with ``docker build --build-arg RUNTIME_TRITON_COMPILER=0 ...`` for A/B tests.
-ARG RUNTIME_TRITON_COMPILER=1
-RUN if [ "$RUNTIME_TRITON_COMPILER" = "1" ]; then \
-      apt-get update -y \
-      && apt-get install -y --no-install-recommends build-essential python3-dev \
-      && rm -rf /var/lib/apt/lists/*; \
-    fi
-
-# CUDA *runtime* base images omit ``nvcc``; FlashInfer JIT-compiles attention
-# kernels with ``/usr/local/cuda/bin/nvcc``. Keep ``cuda-nvcc-*`` in sync with
-# ``CUDA_VERSION`` (12.8.x -> ``cuda-nvcc-12-8``).
-RUN wget -qO /tmp/cuda-keyring.deb \
+# Must match ``CUDA_VERSION`` major.minor (12.8 -> ``12-8`` -> package ``cuda-nvcc-12-8``).
+ARG CUDA_APT=12-8
+# Single RUN: fewer layers; ``gcc``/``Python.h`` (Triton), ``nvcc``/``ninja`` (FlashInfer JIT).
+RUN set -eu \
+ && apt-get update -y \
+ && apt-get install -y --no-install-recommends wget ca-certificates \
+ && wget -qO /tmp/cuda-keyring.deb \
       https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb \
-    && dpkg -i /tmp/cuda-keyring.deb \
-    && rm -f /tmp/cuda-keyring.deb \
-    && apt-get update -y \
-    && apt-get install -y --no-install-recommends cuda-nvcc-12-8 ninja-build \
-    && rm -rf /var/lib/apt/lists/*
+ && dpkg -i /tmp/cuda-keyring.deb \
+ && rm -f /tmp/cuda-keyring.deb \
+ && apt-get update -y \
+ && apt-get install -y --no-install-recommends \
+      libsndfile1 \
+      ffmpeg \
+      build-essential \
+      python3-dev \
+      cuda-nvcc-${CUDA_APT} \
+      ninja-build \
+ && rm -rf /var/lib/apt/lists/*
 
-# Centralize every model-cache location so a single PVC mount on
-# /tmp/_cached_models persists all downloaded weights (Qwen3-ASR,
-# Qwen3-ForcedAligner, tokenizers, vLLM compile cache, etc.).
 ENV MODEL_CACHE_DIR=/tmp/_cached_models \
     HF_HOME=/tmp/_cached_models \
     HF_HUB_CACHE=/tmp/_cached_models \
@@ -199,9 +160,6 @@ WORKDIR /data/shared/Qwen3-ASR
 
 EXPOSE 8000
 
-# Default command: start the vLLM + forced-aligner server. Override with
-# `docker run ... <your-command>` (e.g. `sleep infinity`) to get a shell
-# for debugging without invoking the server.
 CMD ["/opt/venv/bin/qwen-asr-serve-aligner", \
      "Qwen/Qwen3-ASR-1.7B", \
      "--gpu-memory-utilization", "0.5", \
