@@ -287,6 +287,22 @@ class Qwen3ASRModel:
             max_new_tokens=None,
         )
 
+    @classmethod
+    def load_forced_aligner(
+        cls,
+        forced_aligner: str,
+        forced_aligner_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> "Qwen3ForcedAligner":
+        """
+        Load only the forced-aligner weights.
+
+        Uses the same ``Qwen3ForcedAligner.from_pretrained`` call as :meth:`from_pretrained`
+        and :meth:`LLM` when ``forced_aligner`` / ``forced_aligner_kwargs`` are set.
+        """
+        return Qwen3ForcedAligner.from_pretrained(
+            forced_aligner, **(forced_aligner_kwargs or {})
+        )
+
     def get_supported_languages(self) -> List[str]:
         """
         Returns the supported language list.

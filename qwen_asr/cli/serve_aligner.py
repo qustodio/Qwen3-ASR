@@ -17,6 +17,10 @@
 vLLM ``serve`` entry with forced-aligner support for ``/v1/audio/transcriptions``
 (``response_format=verbose_json``). Use console script ``qwen-asr-serve-aligner``.
 
+The forced aligner is loaded the same way as ``Qwen3ASRModel.LLM(..., forced_aligner=...,
+forced_aligner_kwargs=...)`` (see Hugging Face model card); this server still runs ASR inside
+vLLM and applies alignment in the OpenAI transcription hook afterward.
+
 The forced aligner defaults to **CPU** so it does not compete with vLLM for VRAM.
 To run it on GPU (when you have spare VRAM or a second GPU), either:
 
@@ -57,6 +61,7 @@ from qwen_asr.core.transformers_backend import (
     Qwen3ASRForConditionalGeneration,
     Qwen3ASRProcessor,
 )
+from qwen_asr import Qwen3ASRModel
 from qwen_asr.inference.utils import parse_asr_output
 from transformers import AutoConfig, AutoModel, AutoProcessor
 
@@ -107,9 +112,9 @@ def _pop_aligner_device_cli(argv: List[str]) -> List[str]:
     return out
 
 
-def _forced_aligner_from_pretrained_kwargs() -> Dict[str, Any]:
+def _default_forced_aligner_kwargs() -> Dict[str, Any]:
     """
-    Kwargs for ``Qwen3ForcedAligner.from_pretrained``.
+    Default ``forced_aligner_kwargs`` (same keys as ``Qwen3ASRModel.LLM`` / model card).
 
     Default CPU avoids CUDA OOM alongside a GPU-resident vLLM ASR engine.
     Override with ``QWEN_ASR_ALIGNER_DEVICE`` or ``--aligner-device`` (see module docstring).
@@ -125,8 +130,8 @@ def _forced_aligner_from_pretrained_kwargs() -> Dict[str, Any]:
     return {"dtype": torch.bfloat16, "device_map": dev}
 
 _ORIG_CREATE_SPEECH_TO_TEXT = None
-_HOOK_ALIGNER_CKPT: Optional[str] = None
-_HOOK_ALIGNER_KWARGS: Optional[Dict[str, Any]] = None
+_HOOK_FORCED_ALIGNER: Optional[str] = None
+_HOOK_FORCED_ALIGNER_KWARGS: Optional[Dict[str, Any]] = None
 _ALIGNER = None
 _ALIGNER_INIT_LOCK = threading.Lock()
 # None = unlimited concurrent align() calls; Lock(1) or Semaphore(N) when configured.
@@ -374,7 +379,7 @@ class _AlignBatchCoordinator:
         from qwen_asr.inference.utils import SAMPLE_RATE
 
         def _thread_fn() -> list[Any]:
-            aligner = _get_aligner(_HOOK_ALIGNER_CKPT, _HOOK_ALIGNER_KWARGS or {})
+            aligner = _get_aligner(_HOOK_FORCED_ALIGNER, _HOOK_FORCED_ALIGNER_KWARGS or {})
             audios = [(wav, SAMPLE_RATE) for wav, _, _, _ in batch]
             texts = [t for _, t, _, _ in batch]
             langs = [lang for _, _, lang, _ in batch]
@@ -560,13 +565,13 @@ def _looks_suspicious_short_text(text: str, requested_lang: Optional[str]) -> bo
     return False
 
 
-def _get_aligner(aligner_ckpt: str, aligner_kwargs: Dict[str, Any]):
+def _get_aligner(forced_aligner: str, forced_aligner_kwargs: Dict[str, Any]):
     global _ALIGNER
     with _ALIGNER_INIT_LOCK:
         if _ALIGNER is None:
-            from qwen_asr.inference.qwen3_forced_aligner import Qwen3ForcedAligner
-
-            _ALIGNER = Qwen3ForcedAligner.from_pretrained(aligner_ckpt, **aligner_kwargs)
+            _ALIGNER = Qwen3ASRModel.load_forced_aligner(
+                forced_aligner, forced_aligner_kwargs
+            )
         return _ALIGNER
 
 
@@ -834,11 +839,13 @@ def _build_sentence_segments_from_text(
     return segments
 
 
-def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[str, Any]) -> None:
-    global _ORIG_CREATE_SPEECH_TO_TEXT, _HOOK_ALIGNER_CKPT, _HOOK_ALIGNER_KWARGS
+def _install_transcription_aligner_hook(
+    forced_aligner: str, forced_aligner_kwargs: Dict[str, Any]
+) -> None:
+    global _ORIG_CREATE_SPEECH_TO_TEXT, _HOOK_FORCED_ALIGNER, _HOOK_FORCED_ALIGNER_KWARGS
 
-    _HOOK_ALIGNER_CKPT = aligner_ckpt
-    _HOOK_ALIGNER_KWARGS = dict(aligner_kwargs)
+    _HOOK_FORCED_ALIGNER = forced_aligner
+    _HOOK_FORCED_ALIGNER_KWARGS = dict(forced_aligner_kwargs)
 
     from vllm.entrypoints.openai.protocol import (
         ErrorResponse,
@@ -885,7 +892,7 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
                 )
 
         want_align = (
-            _HOOK_ALIGNER_CKPT is not None
+            _HOOK_FORCED_ALIGNER is not None
             and self.task_type == "transcribe"
             and _is_qwen3_asr_handler(self)
             and request.response_format == "verbose_json"
@@ -930,7 +937,7 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
             plain_text = _sanitize_asr_text(plain_text)
             align_lang = user_lang_name or lang or "English"
 
-            aligner = _get_aligner(_HOOK_ALIGNER_CKPT, _HOOK_ALIGNER_KWARGS or {})
+            aligner = _get_aligner(_HOOK_FORCED_ALIGNER, _HOOK_FORCED_ALIGNER_KWARGS or {})
 
             wav = await wav_task
         finally:
@@ -1098,13 +1105,17 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
 
 def main():
     sys.argv[1:] = _pop_aligner_device_cli(sys.argv[1:])
-    kw = _forced_aligner_from_pretrained_kwargs()
+    forced_aligner_kwargs = _default_forced_aligner_kwargs()
     LOGGER.info(
-        "Loading Qwen3-ForcedAligner with %s "
-        "(override: --aligner-device cuda:0 or QWEN_ASR_ALIGNER_DEVICE)",
-        kw,
+        "Loading forced aligner %s with forced_aligner_kwargs=%s "
+        "(same as Qwen3ASRModel.LLM; override device via --aligner-device or "
+        "QWEN_ASR_ALIGNER_DEVICE)",
+        DEFAULT_FORCED_ALIGNER_CHECKPOINT,
+        forced_aligner_kwargs,
     )
-    _install_transcription_aligner_hook(DEFAULT_FORCED_ALIGNER_CHECKPOINT, kw)
+    _install_transcription_aligner_hook(
+        DEFAULT_FORCED_ALIGNER_CHECKPOINT, forced_aligner_kwargs
+    )
     sys.argv.insert(1, "serve")
     vllm_main()
 
