@@ -26,7 +26,15 @@ To run it on GPU (when you have spare VRAM or a second GPU), either:
 Concurrent requests: forced alignment no longer serializes globally by default. To cap how
 many aligner forwards run at once (e.g. to limit RAM on CPU or VRAM on GPU), set
 ``QWEN_ASR_ALIGNER_MAX_CONCURRENT`` to an integer (``1`` restores strict serialization).
-Unset or ``0`` means no limit.
+Unset or ``0`` means no limit. The limit is read on the **first** ``verbose_json`` transcription
+in each process (set the variable before starting the server). With multiple API/engine worker
+processes, each process applies its own cap, so total concurrency is roughly
+``N * number_of_workers``.
+
+Optional **batched** forced alignment (same process): set ``QWEN_ASR_ALIGN_BATCH_MAX`` to an
+integer ``>=2`` to merge up to that many concurrent ``align()`` calls into one HF forward (adds
+up to ``QWEN_ASR_ALIGN_BATCH_WAIT_MS`` milliseconds latency per flush when the batch is not full).
+``0`` or ``1`` disables batching (legacy one-sample ``align()`` per request).
 """
 from __future__ import annotations
 
@@ -35,11 +43,11 @@ import io
 import os
 import re
 import sys
+import time
 import unicodedata
 import threading
 from typing import Any, Dict, List, Optional
 
-import librosa
 import numpy as np
 import soundfile as sf
 
@@ -68,7 +76,8 @@ except Exception as e:
 from vllm.entrypoints.cli.main import main as vllm_main
 from vllm.logger import init_logger
 
-LOGGER = init_logger(__name__)
+# Under ``vllm.*`` so logs use vLLM's console handler (``qwen_asr.*`` would not).
+LOGGER = init_logger("vllm.qwen_asr.serve_aligner")
 
 DEFAULT_FORCED_ALIGNER_CHECKPOINT = "Qwen/Qwen3-ForcedAligner-0.6B"
 
@@ -121,46 +130,208 @@ _ALIGNER = None
 _ALIGNER_INIT_LOCK = threading.Lock()
 # None = unlimited concurrent align() calls; Lock(1) or Semaphore(N) when configured.
 _ALIGNER_INFER_LIMITER: Optional[Any] = None
+_ALIGNER_INFER_LIMITER_CONFIGURED = False
+_ALIGNER_LIMITER_CFG_LOCK = threading.Lock()
 _SENTENCE_END_CHARS = (".", "!", "?", "。", "！", "？", ";", "；")
 
 
 def _configure_aligner_infer_limiter() -> None:
     """
-    Read ``QWEN_ASR_ALIGNER_MAX_CONCURRENT`` once at hook install time.
+    Read ``QWEN_ASR_ALIGNER_MAX_CONCURRENT`` and set ``_ALIGNER_INFER_LIMITER``.
 
     - unset / empty / ``0``: no limiter (parallel aligner inference).
     - ``1``: global lock (legacy serialized behavior).
     - ``N>1``: at most N aligner forwards at a time.
     """
     global _ALIGNER_INFER_LIMITER
-    raw = (os.environ.get("QWEN_ASR_ALIGNER_MAX_CONCURRENT") or "0").strip().lower()
+    raw_env = os.environ.get("QWEN_ASR_ALIGNER_MAX_CONCURRENT")
+    raw = (raw_env or "0").strip().lower()
     if raw in ("", "0", "unlimited", "none"):
         _ALIGNER_INFER_LIMITER = None
-        LOGGER.info("Forced-aligner inference concurrency: unlimited")
+        LOGGER.info(
+            "Forced-aligner inference concurrency: unlimited (QWEN_ASR_ALIGNER_MAX_CONCURRENT=%r)",
+            raw_env,
+        )
         return
     try:
         n = int(raw)
     except ValueError:
         LOGGER.warning(
             "Ignoring invalid QWEN_ASR_ALIGNER_MAX_CONCURRENT=%r; using unlimited aligner concurrency",
-            os.environ.get("QWEN_ASR_ALIGNER_MAX_CONCURRENT"),
+            raw_env,
         )
         _ALIGNER_INFER_LIMITER = None
-        LOGGER.info("Forced-aligner inference concurrency: unlimited")
+        LOGGER.info(
+            "Forced-aligner inference concurrency: unlimited (QWEN_ASR_ALIGNER_MAX_CONCURRENT=%r)",
+            raw_env,
+        )
         return
     if n <= 0:
         _ALIGNER_INFER_LIMITER = None
-        LOGGER.info("Forced-aligner inference concurrency: unlimited")
+        LOGGER.info(
+            "Forced-aligner inference concurrency: unlimited (QWEN_ASR_ALIGNER_MAX_CONCURRENT=%r)",
+            raw_env,
+        )
         return
     if n == 1:
         _ALIGNER_INFER_LIMITER = threading.Lock()
-        LOGGER.info("Forced-aligner inference concurrency: serialized (1)")
+        LOGGER.info(
+            "Forced-aligner inference concurrency: serialized (1) (QWEN_ASR_ALIGNER_MAX_CONCURRENT=%r)",
+            raw_env,
+        )
         return
     _ALIGNER_INFER_LIMITER = threading.Semaphore(n)
-    LOGGER.info("Forced-aligner inference concurrency: max %d concurrent", n)
+    LOGGER.info(
+        "Forced-aligner inference concurrency: max %d concurrent (QWEN_ASR_ALIGNER_MAX_CONCURRENT=%r)",
+        n,
+        raw_env,
+    )
+
+
+def _ensure_aligner_infer_limiter() -> None:
+    """Apply ``QWEN_ASR_ALIGNER_MAX_CONCURRENT`` once per process, before the first aligned transcribe."""
+    global _ALIGNER_INFER_LIMITER_CONFIGURED
+    if _ALIGNER_INFER_LIMITER_CONFIGURED:
+        return
+    with _ALIGNER_LIMITER_CFG_LOCK:
+        if _ALIGNER_INFER_LIMITER_CONFIGURED:
+            return
+        _configure_aligner_infer_limiter()
+        _ALIGNER_INFER_LIMITER_CONFIGURED = True
+
+
+# Micro-batch concurrent align() forwards (see module docstring: QWEN_ASR_ALIGN_BATCH_*).
+_ALIGN_BATCH_COORD: Optional["_AlignBatchCoordinator"] = None
+_ALIGN_BATCH_COORD_LOCK: Optional[asyncio.Lock] = None
+
+
+def _align_batch_max_from_env() -> int:
+    try:
+        return int((os.environ.get("QWEN_ASR_ALIGN_BATCH_MAX") or "0").strip())
+    except ValueError:
+        return 0
+
+
+def _align_batch_wait_s_from_env() -> float:
+    try:
+        ms = float((os.environ.get("QWEN_ASR_ALIGN_BATCH_WAIT_MS") or "8").strip())
+    except ValueError:
+        ms = 8.0
+    return max(0.0, ms) / 1000.0
+
+
+class _AlignBatchCoordinator:
+    """
+    Queue concurrent alignment requests and run ``Qwen3ForcedAligner.align`` on lists
+    (one GPU/CPU forward per batch). Preserves per-request result order.
+    """
+
+    __slots__ = ("_max_batch", "_wait_s", "_lock", "_pending", "_drain_task")
+
+    def __init__(self, max_batch: int, wait_s: float) -> None:
+        self._max_batch = max(2, int(max_batch))
+        self._wait_s = float(wait_s)
+        self._lock = asyncio.Lock()
+        self._pending: list[tuple[Any, str, str, asyncio.Future]] = []
+        self._drain_task: Optional[asyncio.Task] = None
+
+    async def _delayed_drain(self) -> None:
+        try:
+            if self._wait_s > 0:
+                await asyncio.sleep(self._wait_s)
+        except asyncio.CancelledError:
+            return
+        batch: Optional[list[tuple[Any, str, str, asyncio.Future]]] = None
+        async with self._lock:
+            self._drain_task = None
+            if self._pending:
+                batch = self._pending
+                self._pending = []
+        if batch:
+            await self._execute_batch(batch)
+
+    async def _execute_batch(self, batch: list[tuple[Any, str, str, asyncio.Future]]) -> None:
+        from qwen_asr.inference.utils import SAMPLE_RATE
+
+        def _thread_fn() -> list[Any]:
+            aligner = _get_aligner(_HOOK_ALIGNER_CKPT, _HOOK_ALIGNER_KWARGS or {})
+            audios = [(wav, SAMPLE_RATE) for wav, _, _, _ in batch]
+            texts = [t for _, t, _, _ in batch]
+            langs = [lang for _, _, lang, _ in batch]
+            lim = _ALIGNER_INFER_LIMITER
+            if lim is not None:
+                with lim:
+                    return list(aligner.align(audio=audios, text=texts, language=langs))
+            return list(aligner.align(audio=audios, text=texts, language=langs))
+
+        try:
+            results = await asyncio.to_thread(_thread_fn)
+        except Exception as e:
+            for *_, fut in batch:
+                if not fut.done():
+                    fut.set_exception(e)
+            return
+        if len(results) != len(batch):
+            err = RuntimeError(
+                f"aligner batch size mismatch: got {len(results)} results for {len(batch)} inputs"
+            )
+            for *_, fut in batch:
+                if not fut.done():
+                    fut.set_exception(err)
+            return
+        for (_, _, _, fut), res in zip(batch, results):
+            if not fut.done():
+                fut.set_result(res)
+
+    async def submit(self, wav: Any, plain_text: str, align_lang: str) -> Any:
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        batch_to_run: Optional[list[tuple[Any, str, str, asyncio.Future]]] = None
+        async with self._lock:
+            self._pending.append((wav, plain_text, align_lang, fut))
+            if len(self._pending) >= self._max_batch:
+                batch_to_run = self._pending
+                self._pending = []
+                if self._drain_task is not None:
+                    if not self._drain_task.done():
+                        self._drain_task.cancel()
+                    self._drain_task = None
+            elif self._drain_task is None or self._drain_task.done():
+                self._drain_task = asyncio.create_task(self._delayed_drain())
+        if batch_to_run is not None:
+            await self._execute_batch(batch_to_run)
+        return await fut
+
+
+async def _get_align_batch_coordinator() -> Optional[_AlignBatchCoordinator]:
+    global _ALIGN_BATCH_COORD, _ALIGN_BATCH_COORD_LOCK
+    if _align_batch_max_from_env() <= 1:
+        return None
+    if _ALIGN_BATCH_COORD is not None:
+        return _ALIGN_BATCH_COORD
+    if _ALIGN_BATCH_COORD_LOCK is None:
+        _ALIGN_BATCH_COORD_LOCK = asyncio.Lock()
+    async with _ALIGN_BATCH_COORD_LOCK:
+        if _ALIGN_BATCH_COORD is None:
+            mx = _align_batch_max_from_env()
+            if mx <= 1:
+                return None
+            _ALIGN_BATCH_COORD = _AlignBatchCoordinator(mx, _align_batch_wait_s_from_env())
+            LOGGER.info(
+                "Forced-aligner batching enabled: QWEN_ASR_ALIGN_BATCH_MAX=%d QWEN_ASR_ALIGN_BATCH_WAIT_MS=%s",
+                mx,
+                os.environ.get("QWEN_ASR_ALIGN_BATCH_WAIT_MS", "8"),
+            )
+        return _ALIGN_BATCH_COORD
 
 
 def _bytes_to_wav_16k_mono(audio_data: bytes) -> np.ndarray:
+    """
+    Decode request-body audio to a mono float32 waveform at 16 kHz.
+
+    For **mono PCM at 16 kHz** (typical WAV), ``soundfile`` decode is essentially the only
+    cost: stereo down-mix and ``librosa`` resampling are skipped automatically.
+    """
     with io.BytesIO(audio_data) as f:
         wav, sr = sf.read(f, dtype="float32", always_2d=False)
     wav = np.asarray(wav, dtype=np.float32)
@@ -168,6 +339,8 @@ def _bytes_to_wav_16k_mono(audio_data: bytes) -> np.ndarray:
         wav = np.mean(wav, axis=-1).astype(np.float32)
     sr = int(sr)
     if sr != 16000:
+        import librosa
+
         wav = librosa.resample(wav, orig_sr=sr, target_sr=16000).astype(np.float32)
     return wav
 
@@ -544,8 +717,6 @@ def _build_sentence_segments_from_text(
 def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[str, Any]) -> None:
     global _ORIG_CREATE_SPEECH_TO_TEXT, _HOOK_ALIGNER_CKPT, _HOOK_ALIGNER_KWARGS
 
-    _configure_aligner_infer_limiter()
-
     _HOOK_ALIGNER_CKPT = aligner_ckpt
     _HOOK_ALIGNER_KWARGS = dict(aligner_kwargs)
 
@@ -564,6 +735,24 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
     orig = _ORIG_CREATE_SPEECH_TO_TEXT
 
     async def _wrapped(self, audio_data: bytes, request, raw_request, response_class, stream_generator_method):
+        def _log_transcription_timing(
+            asr_s: float, aligner_s: Optional[float] = None, *, detail: str = ""
+        ) -> None:
+            suffix = f" {detail}" if detail else ""
+            if aligner_s is None:
+                LOGGER.info(
+                    "Transcription timing: ASR model=%.3fs, aligner=skipped%s",
+                    asr_s,
+                    suffix,
+                )
+            else:
+                LOGGER.info(
+                    "Transcription timing: ASR model=%.3fs, aligner=%.3fs%s",
+                    asr_s,
+                    aligner_s,
+                    suffix,
+                )
+
         want_align = (
             _HOOK_ALIGNER_CKPT is not None
             and self.task_type == "transcribe"
@@ -573,7 +762,10 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
         if not want_align:
             return await orig(self, audio_data, request, raw_request, response_class, stream_generator_method)
 
+        _ensure_aligner_infer_limiter()
+
         request_json = request.model_copy(update={"response_format": "json"})
+        t_asr_start = time.perf_counter()
         base = await orig(
             self,
             audio_data,
@@ -582,22 +774,35 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
             TranscriptionResponse,
             stream_generator_method,
         )
+        asr_s = time.perf_counter() - t_asr_start
         if isinstance(base, ErrorResponse):
+            _log_transcription_timing(asr_s, detail="(ASR error response)")
             return base
 
-        user_lang_name = None
-        if request.language:
-            user_lang_name = self.model_cls.supported_languages.get(request.language)
+        # Decode/resample audio in a worker thread while we parse text and (on first use) load the
+        # aligner, so those CPU/IO-bound steps overlap instead of running strictly sequentially.
+        wav_task = asyncio.create_task(asyncio.to_thread(_bytes_to_wav_16k_mono, audio_data))
+        try:
+            user_lang_name = None
+            if request.language:
+                user_lang_name = self.model_cls.supported_languages.get(request.language)
 
-        # Parse raw model output without forcing user language, so metadata can be stripped robustly.
-        lang, plain_text = parse_asr_output(base.text, user_language=None)
-        plain_text = _sanitize_asr_text(plain_text)
-        align_lang = user_lang_name or lang or "English"
+            # Parse raw model output without forcing user language, so metadata can be stripped robustly.
+            lang, plain_text = parse_asr_output(base.text, user_language=None)
+            plain_text = _sanitize_asr_text(plain_text)
+            align_lang = user_lang_name or lang or "English"
 
-        wav = _bytes_to_wav_16k_mono(audio_data)
+            aligner = _get_aligner(_HOOK_ALIGNER_CKPT, _HOOK_ALIGNER_KWARGS or {})
+
+            wav = await wav_task
+        finally:
+            if not wav_task.done():
+                await wav_task
+
         duration_s = float(len(wav)) / 16000.0
         if _is_low_energy_audio(wav):
             LOGGER.info("Low-energy audio detected; suppressing transcript")
+            _log_transcription_timing(asr_s, detail="(low-energy audio)")
             return TranscriptionResponseVerbose(
                 text="",
                 language=request.language or lang or "",
@@ -606,6 +811,7 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
                 words=[],
             )
         if not plain_text.strip():
+            _log_transcription_timing(asr_s, detail="(empty transcript)")
             return TranscriptionResponseVerbose(
                 text="",
                 language=request.language or lang or "",
@@ -619,6 +825,7 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
                 plain_text,
                 user_lang_name,
             )
+            _log_transcription_timing(asr_s, detail="(suspicious short/script-mismatch)")
             return TranscriptionResponseVerbose(
                 text="",
                 language=request.language or lang or "",
@@ -628,6 +835,7 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
             )
         if _should_suppress_hallucinated_text(plain_text, wav):
             LOGGER.info("Suppressing likely hallucinated short transcript on low-energy audio: %r", plain_text)
+            _log_transcription_timing(asr_s, detail="(hallucination guard)")
             return TranscriptionResponseVerbose(
                 text="",
                 language=request.language or lang or "",
@@ -636,9 +844,7 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
                 words=[],
             )
 
-        aligner = _get_aligner(_HOOK_ALIGNER_CKPT, _HOOK_ALIGNER_KWARGS or {})
-
-        def _do_align():
+        def _do_align_single() -> Any:
             from qwen_asr.inference.utils import SAMPLE_RATE
 
             lim = _ALIGNER_INFER_LIMITER
@@ -649,13 +855,22 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
                 out = aligner.align(audio=(wav, SAMPLE_RATE), text=plain_text, language=align_lang)
             return out[0] if out else None
 
+        t_align_start = time.perf_counter()
         try:
-            align_result = await asyncio.to_thread(_do_align)
+            batch_coord = await _get_align_batch_coordinator()
+            if batch_coord is not None:
+                align_result = await batch_coord.submit(wav, plain_text, align_lang)
+            else:
+                align_result = await asyncio.to_thread(_do_align_single)
         except Exception:
+            aligner_s = time.perf_counter() - t_align_start
+            _log_transcription_timing(asr_s, aligner_s, detail="(aligner raised)")
             LOGGER.exception("Qwen3-ForcedAligner failed during /v1/audio/transcriptions")
             return self.create_error_response("Forced alignment failed; check server logs.")
+        aligner_s = time.perf_counter() - t_align_start
 
         if align_result is None or not align_result.items:
+            _log_transcription_timing(asr_s, aligner_s, detail="(no alignment items)")
             return TranscriptionResponseVerbose(
                 text=plain_text,
                 language=request.language or lang or "",
@@ -688,6 +903,7 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
                 len(words),
                 duration_s,
             )
+            _log_transcription_timing(asr_s, aligner_s, detail="(degenerate timestamps)")
             return TranscriptionResponseVerbose(
                 text="",
                 language=request.language or lang or "",
@@ -723,6 +939,7 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
                     tokens=[],
                 )
             ]
+        _log_transcription_timing(asr_s, aligner_s)
         return TranscriptionResponseVerbose(
             text=plain_text,
             language=request.language or lang or "",

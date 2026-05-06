@@ -1,3 +1,31 @@
+## Qustodio Qwen3-ASR
+
+In Qustodio we've implemented a new script `serve_aligner.py` that first runs the Qwen3-ASR model and right after
+the Aligner model is run so that timestamps are returned in the response.
+
+In order to get as much performance as possible, both models need to run on GPU. Therefore, when running the script it's
+recommended to add the following parameters:
+
+* `--gpu-memory-utilization 0.5` so that half of the GPU is reserved for the ASR model and the rest can be used by the Aligner model.
+* `--aligner-device cuda:0` to tell the Aligner model to use the GPU. This parameter can be replaced with the `QWEN_ASR_ALIGNER_DEVICE` environment variable.
+
+The Aligner model can run in a batched mode (recommended). There are 2 environment variables that control batching on the Aligner model:
+
+* `QWEN_ASR_ALIGN_BATCH_MAX`: If `>= 2` it merges up to that many concurrent calls to the model.
+* `QWEN_ASR_ALIGN_BATCH_WAIT_MS`: That latency (in ms) is added per flush when the batch is not full.
+
+### Building the Docker image
+
+    docker buildx build --platform linux/amd64 \
+        -f docker/Dockerfile-qwen3-asr-cu128 \
+        -t "${ECR_URI}/${ECR_REPO}:20260505" --push --provenance=false \
+        --build-arg BUNDLE_FLASH_ATTENTION=false .
+
+Please note that:
+* `--provenance=false` is set for compatibility with AWS ECR
+* `--BUNDLE_FLASH_ATTENTION=false` is set because FlashAttention-2 dropped support for T4 GPUs (the one in g4dn.xlarge instance) so it can't be executed - FlashInfer is used instead. In case we upgrade to g5 instances, we might consider enabling this flag.
+
+
 ## Fine-tuning Qwen3-ASR
 
 This script fine-tunes **Qwen3-ASR** using JSONL audio-text pairs. It supports multi-GPU training via `torchrun`.
