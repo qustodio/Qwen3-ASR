@@ -39,6 +39,7 @@ up to ``QWEN_ASR_ALIGN_BATCH_WAIT_MS`` milliseconds latency per flush when the b
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import io
 import os
 import re
@@ -133,6 +134,125 @@ _ALIGNER_INFER_LIMITER: Optional[Any] = None
 _ALIGNER_INFER_LIMITER_CONFIGURED = False
 _ALIGNER_LIMITER_CFG_LOCK = threading.Lock()
 _SENTENCE_END_CHARS = (".", "!", "?", "。", "！", "？", ";", "；")
+
+_ALIGNED_ENGINE_PATCH_IDS: set[int] = set()
+_ALIGNED_ENGINE_PATCH_LOCK = threading.Lock()
+_ALIGNED_VERBOSE_MODELS: tuple[type, type] | None = None
+_ALIGNED_CAPTURE_LOCK = threading.Lock()
+
+
+class _AlignedTokenTotals:
+    __slots__ = ("prompt_tokens", "completion_tokens", "encoder_prompt_tokens")
+
+    def __init__(self) -> None:
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.encoder_prompt_tokens = 0
+
+
+# Fallback when request_id must be used (ContextVar not visible in the yielding task).
+_ALIGNED_CAPTURE_BY_PREFIX: Dict[str, _AlignedTokenTotals] = {}
+# Primary: active aligned-transcription token bucket for this asyncio Task.
+_ALIGNED_TOKEN_TOTALS_CTX: contextvars.ContextVar[Optional[_AlignedTokenTotals]] = contextvars.ContextVar(
+    "qwen_asr_aligned_token_totals", default=None
+)
+
+
+def _accum_aligned_tokens(output: Any, totals: _AlignedTokenTotals) -> None:
+    """
+    Merge counts from one engine yield. Do not require ``finished`` — vLLM may omit it on
+    partial yields.
+
+    Decoder prompt lengths are treated as the running maximum (typically stable). Completion
+    counts may be cumulative across yields (monotonic) or reset per chunk (sum increments).
+    """
+    pt_ids = getattr(output, "prompt_token_ids", None) or []
+    if pt_ids:
+        totals.prompt_tokens = max(totals.prompt_tokens, len(pt_ids))
+    enc_ids = getattr(output, "encoder_prompt_token_ids", None) or []
+    if enc_ids:
+        totals.encoder_prompt_tokens = max(totals.encoder_prompt_tokens, len(enc_ids))
+    outs = getattr(output, "outputs", None) or []
+    if outs:
+        try:
+            ct = len(outs[0].token_ids)
+        except TypeError:
+            ct = 0
+        if ct >= totals.completion_tokens:
+            totals.completion_tokens = ct
+        else:
+            totals.completion_tokens += ct
+
+
+def _aligner_token_capture_begin(engine_client: Any, request_id_prefix: str) -> None:
+    _ensure_engine_generate_aligned_capture(engine_client)
+    bucket = _AlignedTokenTotals()
+    _ALIGNED_TOKEN_TOTALS_CTX.set(bucket)
+    with _ALIGNED_CAPTURE_LOCK:
+        _ALIGNED_CAPTURE_BY_PREFIX[request_id_prefix] = bucket
+
+
+def _aligner_token_capture_end(request_id_prefix: str) -> _AlignedTokenTotals:
+    prev = _ALIGNED_TOKEN_TOTALS_CTX.get(None)
+    _ALIGNED_TOKEN_TOTALS_CTX.set(None)
+    with _ALIGNED_CAPTURE_LOCK:
+        _ALIGNED_CAPTURE_BY_PREFIX.pop(request_id_prefix, None)
+    return prev or _AlignedTokenTotals()
+
+
+def _ensure_engine_generate_aligned_capture(engine_client: Any) -> None:
+    cid = id(engine_client)
+    with _ALIGNED_ENGINE_PATCH_LOCK:
+        if cid in _ALIGNED_ENGINE_PATCH_IDS:
+            return
+        original = engine_client.generate
+
+        async def _generate_with_optional_token_capture(prompt: Any, sampling_params: Any, request_id: str, **kwargs: Any):
+            async for output in original(prompt, sampling_params, request_id, **kwargs):
+                totals = _ALIGNED_TOKEN_TOTALS_CTX.get(None)
+                if totals is None:
+                    with _ALIGNED_CAPTURE_LOCK:
+                        for cap_prefix, bucket in _ALIGNED_CAPTURE_BY_PREFIX.items():
+                            if request_id == cap_prefix or request_id.startswith(cap_prefix + "_"):
+                                totals = bucket
+                                break
+                if totals is not None:
+                    _accum_aligned_tokens(output, totals)
+                yield output
+
+        setattr(engine_client, "generate", _generate_with_optional_token_capture)
+        _ALIGNED_ENGINE_PATCH_IDS.add(cid)
+
+
+def _ensure_aligned_verbose_models(transcription_verbose_cls: type[Any]) -> tuple[type, type]:
+    global _ALIGNED_VERBOSE_MODELS
+    if _ALIGNED_VERBOSE_MODELS is not None:
+        return _ALIGNED_VERBOSE_MODELS
+    from pydantic import BaseModel
+
+    class AlignedVerboseTranscriptionTokens(BaseModel):
+
+        total: int
+        by_type: Dict[str, int]
+
+    class AlignedTranscriptionResponseVerbose(transcription_verbose_cls):  # type: ignore[misc]
+        tokens: AlignedVerboseTranscriptionTokens
+
+        def model_dump(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+            data = super().model_dump(*args, **kwargs)
+            data.pop("words", None)
+            segs = data.get("segments")
+            if isinstance(segs, list):
+                data["segments"] = [
+                    {"id": s["id"], "start": s["start"], "end": s["end"], "text": s["text"]} for s in segs
+                ]
+            return data
+
+    _ALIGNED_VERBOSE_MODELS = (
+        AlignedVerboseTranscriptionTokens,
+        AlignedTranscriptionResponseVerbose,
+    )
+    return _ALIGNED_VERBOSE_MODELS
 
 
 def _configure_aligner_infer_limiter() -> None:
@@ -734,6 +854,17 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
 
     orig = _ORIG_CREATE_SPEECH_TO_TEXT
 
+    TokensCls, VerboseCls = _ensure_aligned_verbose_models(TranscriptionResponseVerbose)
+
+    def _tokens_from_totals(totals: _AlignedTokenTotals) -> Any:
+        by_type = {
+            "prompt_tokens": totals.prompt_tokens,
+            "completion_tokens": totals.completion_tokens,
+            "encoder_prompt_tokens": totals.encoder_prompt_tokens,
+        }
+        total = totals.prompt_tokens + totals.completion_tokens + totals.encoder_prompt_tokens
+        return TokensCls(total=total, by_type=dict(by_type))
+
     async def _wrapped(self, audio_data: bytes, request, raw_request, response_class, stream_generator_method):
         def _log_transcription_timing(
             asr_s: float, aligner_s: Optional[float] = None, *, detail: str = ""
@@ -766,14 +897,21 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
 
         request_json = request.model_copy(update={"response_format": "json"})
         t_asr_start = time.perf_counter()
-        base = await orig(
-            self,
-            audio_data,
-            request_json,
-            raw_request,
-            TranscriptionResponse,
-            stream_generator_method,
-        )
+        asr_rid_prefix = f"{self.task_type}-{self._base_request_id(raw_request)}"
+        _aligner_token_capture_begin(self.engine_client, asr_rid_prefix)
+        try:
+            base = await orig(
+                self,
+                audio_data,
+                request_json,
+                raw_request,
+                TranscriptionResponse,
+                stream_generator_method,
+            )
+        finally:
+            asr_tokens_totals = _aligner_token_capture_end(asr_rid_prefix)
+
+        tokens_usage = _tokens_from_totals(asr_tokens_totals)
         asr_s = time.perf_counter() - t_asr_start
         if isinstance(base, ErrorResponse):
             _log_transcription_timing(asr_s, detail="(ASR error response)")
@@ -803,20 +941,22 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
         if _is_low_energy_audio(wav):
             LOGGER.info("Low-energy audio detected; suppressing transcript")
             _log_transcription_timing(asr_s, detail="(low-energy audio)")
-            return TranscriptionResponseVerbose(
+            return VerboseCls(
                 text="",
                 language=request.language or lang or "",
                 duration=str(duration_s),
                 segments=[],
-                words=[],
+                tokens=tokens_usage,
+                words=None,
             )
         if not plain_text.strip():
             _log_transcription_timing(asr_s, detail="(empty transcript)")
-            return TranscriptionResponseVerbose(
+            return VerboseCls(
                 text="",
                 language=request.language or lang or "",
                 duration=str(duration_s),
                 segments=[],
+                tokens=tokens_usage,
                 words=None,
             )
         if _looks_suspicious_short_text(plain_text, user_lang_name):
@@ -826,22 +966,24 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
                 user_lang_name,
             )
             _log_transcription_timing(asr_s, detail="(suspicious short/script-mismatch)")
-            return TranscriptionResponseVerbose(
+            return VerboseCls(
                 text="",
                 language=request.language or lang or "",
                 duration=str(duration_s),
                 segments=[],
-                words=[],
+                tokens=tokens_usage,
+                words=None,
             )
         if _should_suppress_hallucinated_text(plain_text, wav):
             LOGGER.info("Suppressing likely hallucinated short transcript on low-energy audio: %r", plain_text)
             _log_transcription_timing(asr_s, detail="(hallucination guard)")
-            return TranscriptionResponseVerbose(
+            return VerboseCls(
                 text="",
                 language=request.language or lang or "",
                 duration=str(duration_s),
                 segments=[],
-                words=[],
+                tokens=tokens_usage,
+                words=None,
             )
 
         def _do_align_single() -> Any:
@@ -871,7 +1013,7 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
 
         if align_result is None or not align_result.items:
             _log_transcription_timing(asr_s, aligner_s, detail="(no alignment items)")
-            return TranscriptionResponseVerbose(
+            return VerboseCls(
                 text=plain_text,
                 language=request.language or lang or "",
                 duration=str(duration_s),
@@ -886,6 +1028,7 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
                         tokens=[],
                     )
                 ],
+                tokens=tokens_usage,
                 words=None,
             )
 
@@ -904,12 +1047,13 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
                 duration_s,
             )
             _log_transcription_timing(asr_s, aligner_s, detail="(degenerate timestamps)")
-            return TranscriptionResponseVerbose(
+            return VerboseCls(
                 text="",
                 language=request.language or lang or "",
                 duration=str(duration_s),
                 segments=[],
-                words=[],
+                tokens=tokens_usage,
+                words=None,
             )
         split_mode = _segment_split_mode(request)
         # Preferred: split by punctuation from transcript text, map onto word timestamps.
@@ -940,12 +1084,13 @@ def _install_transcription_aligner_hook(aligner_ckpt: str, aligner_kwargs: Dict[
                 )
             ]
         _log_transcription_timing(asr_s, aligner_s)
-        return TranscriptionResponseVerbose(
+        return VerboseCls(
             text=plain_text,
             language=request.language or lang or "",
             duration=str(duration_s),
             segments=segments,
-            words=words,
+            tokens=tokens_usage,
+            words=None,
         )
 
     OpenAISpeechToText._create_speech_to_text = _wrapped
